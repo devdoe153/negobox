@@ -1,0 +1,359 @@
+pragma solidity ^0.5.0;
+
+import "../node_modules/openzeppelin-solidity/contracts/math/SafeMath.sol";
+import "./utils/GetCode2.sol";
+import "../node_modules/openzeppelin-solidity/contracts/token/ERC20/IERC20.sol";
+import "../node_modules/openzeppelin-solidity/contracts/ECRecovery.sol";
+
+contract Nego {
+    using SafeMath for uint256;
+    using ECRecovery for bytes32;
+   
+    IERC20 public negoToken;
+
+    struct Task {
+        address dappContract;
+        TaskStatus status;
+        string callbable;
+        bytes callableArgs;
+        string callback;
+        address worker;
+        bytes sig;
+        uint256 reward;
+        uint256 blockNumber;
+    }
+    enum TaskStatus {InProgress, Executed}
+    enum ReturnValue { Ok, Error}
+
+    address principal;
+
+    struct Worker {
+        address signer;
+        uint8 status;
+        bytes report;
+        uint256 balance;
+    }
+
+    struct WorkerParams {
+        uint256 firstBlockNumber;
+        address[] workerAddresses;
+        uint256 seed;
+    }
+
+    WorkerParams[5] workersParams;
+
+    address[] public workerAddresses;
+
+    mapping(address => Worker) public workers;
+
+    mapping(bytes32 => Task) public tasks;
+
+    event Register(address custodian, address signer, bool _success);
+    event ValidateSig(bytes sig, bytes32 hash, address workerAddr, bool _success);
+    event CommitResults(address dappContract, address worker, bytes sig, uint reward, bool _success);
+    event WorkersParameterized(uint256 seed, address[] workers, bool _success);
+    event ComputeTask(
+        address indexed dappContract,
+        bytes32 indexed taskId,
+        string callable,
+        bytes callableArgs,
+        string callback,
+        uint256 fee,
+        bytes32[] preprocessors,
+        uint256 blockNumber,
+        bool _success
+
+    );
+
+    constructor (address _tokenAddress, address _principal) public {
+        negoToken = IERC20(_tokenAddress);
+        principal = _principal;
+    }
+
+    modifier workerRegistered(address user) {
+        Worker memory worker = workers[user];
+        require(worker.status > 0, "Unregistered worker.");
+        _;
+    }
+
+    function register(address signer, bytes memory report)
+        public 
+        payable
+        returns(ReturnValue)
+    {
+        if (workers[msg.sender].signer == 0x0) {
+            uint index = workerAddresses.length;
+            workerAddresses.length++;
+            workerAddresses[index] = msg.sender;
+            }
+
+        workers[msg.sender].signer = signer ;
+        workers[msg.sender].balance = msg.value;
+        workers[msg.sender].report = report;
+        workers[msg.sender].status = 1;
+
+        emit Register(msg.sender, signer, true);
+            
+        return ReturnValue.Ok;           
+    }
+
+    function generateTaskId(address dappContract, string memory callable, bytes memory  callableArgs, uint256 blockNumber)
+        public 
+        pure
+        returns (bytes32)
+    {
+        bytes32 hash = keccak256(abi.encodePacked(dappContract, callable, callableArgs, blockNumber));
+        return hash;
+    }
+
+    function compute(
+        address dappContract,
+        string memory  callable,
+        bytes memory  callableArgs,
+        string memory  callback,
+        uint256 fee,
+        bytes32[] memory  preprocessors,
+        uint256 blockNumber
+    )
+    public 
+    returns (ReturnValue)
+    {
+        bytes32 taskId = generateTaskId(dappContract, callable, callableArgs, blockNumber);
+        require(tasks[taskId].dappContract == 0x0, "Task with the same taskId already exist");
+
+        tasks[taskId].reward = fee;
+        tasks[taskId].callable = callable;
+        tasks[taskId].callableArgs = callableArgs;
+        tasks[taskId].callback = callback;
+        tasks[taskId].status = TaskStatus.InProgress;
+        tasks[taskId].dappContract = dappContract;
+        tasks[taskId].blockNumber = blockNumber;
+
+        emit ComputeTask(
+            dappContract,
+            taskId,
+            callable,
+            callableArgs,
+            callback,
+            fee,
+            preprocessors,
+            blockNumber,
+            true
+        );
+        negoToken.transferFrom(msg.sender, this, fee);
+
+        return ReturnValue.Ok;
+    }
+
+    function verifyCommitSig(Task memory  task, bytes memory  data, bytes memory  sig)
+        internal
+        returns ( address ) 
+    {
+        bytes memory code = GetCode2.at(task.dappContract);
+
+        bytes32 hash = keccak256(abi.encodePacked(task.callableArgs, data, code));
+
+        address workerAddr = hash.recover(sig);
+
+        emit ValidateSig(sig, hash, workerAddr, true);
+        return workerAddr;
+    }
+
+    function executeCall(address to, uint256 value, bytes memory  data)
+        internal
+        returns ( bool success)
+    {
+        assembly {
+            success := call(gas, to, value, add(data, 0x20), mload(data), 0,0)
+        }
+    }
+
+    function commitResults(bytes32 taskId, bytes memory  data, bytes memory  sig, uint256 blockNumber)
+        public
+        workerRegistered(msg.sender)
+        returns (ReturnValue)
+    {
+        // Task must be solved only once
+        require(tasks[taskId].status == TaskStatus.InProgress, "Illegal status, task must be in progress.");
+        // TODO: run worker selection algo to validate right worker
+        require(block.number > blockNumber, "Block number in the future.");
+
+        address sigAddr = verifyCommitSig(tasks[taskId], data, sig);
+        require(sigAddr != address(0), "Cannot verify this signature.");
+        require(sigAddr == workers[msg.sender].signer, "Invalid signature.");
+
+        // The contract must hold enough fund to distribute reward
+        // TODO: validate that the reward matches the opcodes computed
+        uint256 reward = tasks[taskId].reward;
+        require(reward > 0, "Reward cannot be zero.");
+
+        // Invoking the callback method of the original contract
+        require(executeCall(tasks[taskId].dappContract, 0, data), "Unable to invoke the callback");
+
+        // Keep a trace of the task worker and proof
+        tasks[taskId].worker = msg.sender;
+        tasks[taskId].sig = sig;
+        tasks[taskId].status = TaskStatus.Executed;
+
+        // TODO: send directly to the worker's custodian instead
+        // Put the reward in the worker's bank
+        // He can withdraw later
+        Worker storage worker = workers[msg.sender];
+        worker.balance = worker.balance.add(reward);
+
+        emit CommitResults(tasks[taskId].dappContract, sigAddr, sig, reward, true);
+
+        return ReturnValue.Ok;
+    }
+
+    // Verify the signature submitted while reparameterizing workers
+    function verifyParamsSig(uint256 seed, bytes memory  sig)
+        internal
+        pure
+        returns (address)
+    {
+        bytes32 hash = keccak256(abi.encodePacked(seed));
+        address signer = hash.recover(sig);
+        return signer;
+    }
+
+    /**
+    * Reparameterizing workers with a new seed
+    * This should be called for each epoch by the Principal node
+    *
+    * @param seed The random integer generated by the enclave
+    * @param sig The random integer signed by the the principal node's enclave
+    */
+    function setWorkersParams(uint256 seed, bytes memory  sig)
+        public
+        workerRegistered(msg.sender)
+        returns (ReturnValue)
+    {
+        require(workers[msg.sender].signer == principal, "Only the Principal can update the seed");
+
+        address sigAddr = verifyParamsSig(seed, sig);
+        require(sigAddr == principal, "Invalid signature");
+
+        // Create a new workers parameters item for the specified seed.
+        // The workers parameters list is a sort of cache, it never grows beyond its limit.
+        // If the list is full, the new item will replace the item assigned to the lowest block number.
+        uint ti = 0;
+        for (uint pi = 0; pi < workersParams.length; pi++) {
+            // Find an empty slot in the array, if full use the lowest block number
+            if (workersParams[pi].firstBlockNumber == 0) {
+                ti = pi;
+                break;
+            } else if (workersParams[pi].firstBlockNumber < workersParams[ti].firstBlockNumber) {
+                ti = pi;
+            }
+        }
+        workersParams[ti].firstBlockNumber = block.number;
+        workersParams[ti].seed = seed;
+
+        // Copy the current worker list
+        for (uint wi = 0; wi < workerAddresses.length; wi++) {
+            if (workerAddresses[wi] != 0x0) {
+                workersParams[ti].workerAddresses.length++;
+                workersParams[ti].workerAddresses[wi] = workerAddresses[wi];
+            }
+        }
+        emit WorkersParameterized(seed, workerAddresses, true);
+        return ReturnValue.Ok;
+    }
+
+    // The workers parameters nearest the specified block number
+    // function getWorkersParamsIndex(uint256 blockNumber)
+    //     internal
+    //     view
+    //     returns (int8)
+    // {
+    //     int8 ci = - 1;
+    //     for (uint i = 0; i < workersParams.length; i++) {
+    //         if (workersParams[i].firstBlockNumber <= blockNumber && (ci == - 1 || workersParams[i].firstBlockNumber > workersParams[uint(ci)].firstBlockNumber)) {
+    //             ci = int8(i);
+    //         }
+    //     }
+    //     return ci;
+    // }
+
+    /**
+    * The worker parameters corresponding to the specified block number
+    *
+    * @param blockNumber The reference block number
+    */
+    // function getWorkersParams(uint256 blockNumber)
+    //     public
+    //     view
+    //     returns (uint256, uint256, address[] memory )
+    // {
+    //     // The workers parameters for a given block number
+    //     int8 idx = getWorkersParamsIndex(blockNumber);
+    //     require(idx != - 1, "No workers parameters entry for specified block number");
+
+    //     uint index = uint(idx);
+    //     WorkersParams _workerParams = workersParams[index];
+    //     address[] memory addrs = filterWorkers(_workerParams.workerAddresses);
+
+    //     return (_workerParams.firstBlockNumber, _workerParams.seed, addrs);
+    // }
+
+    // Filter out bad values from a list of worker addresses
+    function filterWorkers(address[] memory  addrs)
+        internal
+        view
+        returns (address[] memory )
+    {
+        // TODO: I don't know why the list contains empty addresses, investigate
+        uint cpt = 0;
+        for (uint i = 0; i < addrs.length; i++) {
+            if (addrs[i] != 0x0 && workers[addrs[i]].signer != principal) {
+                cpt++;
+            }
+        }
+        address[] memory _workers = new address[](cpt);
+        uint cur = 0;
+        for (uint iw = 0; iw < addrs.length; iw++) {
+            if (addrs[iw] != 0x0 && workers[addrs[iw]].signer != principal) {
+                _workers[cur] = addrs[iw];
+                cur++;
+            }
+        }
+        return _workers;
+    }
+
+    /**
+    * Apply pseudo-randomness to discover the selected worker for the specified task
+    *
+    * @param blockNumber The reference block number
+    * @param taskId The reference task id
+    */
+    // function selectWorker(uint256 blockNumber, bytes32 taskId)
+    //     public
+    //     view
+    //     returns (address)
+    // {
+    //     (uint256 memory  b, uint256 memory  seed, address[] memory workerArray) = getWorkersParams(blockNumber);
+    //     address[] memory _workers = filterWorkers(workerArray);
+
+    //     bytes32 hash = keccak256(abi.encodePacked(seed, taskId));
+    //     uint256 index = uint256(hash) % _workers.length;
+    //     return _workers[index];
+    // }
+
+    /**
+    * The RLP encoded report returned by the IAS server
+    *
+    * @param custodian The worker's custodian address
+    */
+    function getReport(address custodian)
+        public
+        view
+        workerRegistered(custodian)
+        returns (address, bytes memory )
+    {
+        // The RLP encoded report and signer's address for the specified worker
+        require(workers[custodian].signer != 0x0, "Worker not registered");
+        return (workers[custodian].signer, workers[custodian].report);
+    }
+
+}
